@@ -24,6 +24,7 @@ static NSString *const UDKeyPreferredGIFFallbackFormat = @"PreferredGIFFallbackF
 static NSString *const UDKeyUnmuteCommentsVideos = @"UnmuteCommentsVideos";
 static NSString *const UDKeyOpenLinksInSteamApp = @"OpenLinksInSteamApp";
 static NSString *const UDKeyCollapsePinnedComments = @"CollapsePinnedComments";
+static NSString *const UDKeyRevealDeletedComments = @"RevealDeletedComments";
 static NSString *const UDKeyFilterNSFWRecentlyRead = @"FilterNSFWRecentlyRead";
 static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 static NSString *const UDKeyImageUploadProvider = @"ImageUploadProvider";

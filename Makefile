@@ -38,6 +38,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloGiphyClient.m \
     $(SRC_DIR)/GiphyPickerViewController.m \
     $(SRC_DIR)/ApolloCreatedAtAlert.xm \
+    $(SRC_DIR)/ApolloRevealDeletedComments.xm \
     $(SRC_DIR)/ApolloState.m \
     $(SRC_DIR)/ApolloShareLinks.xm \
     $(SRC_DIR)/ApolloMedia.xm \

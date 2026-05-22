@@ -12,6 +12,9 @@ NSString *sTrendingSubredditsSource = nil;
 NSString *sTrendingSubredditsLimit = nil;
 
 BOOL sBlockAnnouncements = NO;
+BOOL sRevealDeletedComments = NO;
+NSString *sRevealLastObservedCommentsLinkFullName = nil;
+NSDate *sRevealLastObservedCommentsLinkDate = nil;
 BOOL sShowRecentlyReadThumbnails = YES;
 NSInteger sPreferredGIFFallbackFormat = 1; // 0=GIF, 1=MP4
 
