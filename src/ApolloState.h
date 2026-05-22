@@ -12,9 +12,9 @@ extern NSString *sTrendingSubredditsSource;
 extern NSString *sTrendingSubredditsLimit;
 
 extern BOOL sBlockAnnouncements;
-extern BOOL sRevealDeletedComments;
-extern NSString *sRevealLastObservedCommentsLinkFullName;
-extern NSDate *sRevealLastObservedCommentsLinkDate;
+extern BOOL sShowDeletedComments;
+extern NSString *sDeletedCommentsLastObservedLinkFullName;
+extern NSDate *sDeletedCommentsLastObservedLinkDate;
 extern BOOL sShowRecentlyReadThumbnails;
 extern NSInteger sPreferredGIFFallbackFormat;
 

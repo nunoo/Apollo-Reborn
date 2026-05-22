@@ -8,6 +8,7 @@
 #import "fishhook.h"
 #import "ApolloCommon.h"
 #import "ApolloRedditMediaUpload.h"
+#import "ApolloDeletedCommentsData.h"
 #import "ApolloImageUploadHost.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloState.h"
@@ -365,481 +366,13 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     return request;
 }
 
-static BOOL ApolloRevealIsRedditHost(NSString *host) {
-    NSString *lowerHost = [host lowercaseString];
-    return [lowerHost isEqualToString:@"oauth.reddit.com"] ||
-           [lowerHost isEqualToString:@"www.reddit.com"] ||
-           [lowerHost isEqualToString:@"old.reddit.com"] ||
-           [lowerHost isEqualToString:@"reddit.com"] ||
-           [lowerHost hasSuffix:@".reddit.com"];
-}
-
-static NSString *ApolloRevealNormalizeLinkID(NSString *identifier) {
-    NSString *trimmed = [identifier stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) return nil;
-    if ([trimmed hasPrefix:@"t3_"] && trimmed.length > 3) return trimmed;
-    if ([trimmed hasPrefix:@"t1_"] ||
-        [trimmed hasPrefix:@"t2_"] ||
-        [trimmed hasPrefix:@"t4_"] ||
-        [trimmed hasPrefix:@"t5_"] ||
-        [trimmed hasPrefix:@"t6_"]) return nil;
-    if ([trimmed rangeOfString:@","].location != NSNotFound) return nil;
-    return [@"t3_" stringByAppendingString:trimmed];
-}
-
-static NSString *ApolloRevealLinkFullNameFromRedditURL(NSURL *url) {
-    if (!url || !ApolloRevealIsRedditHost(url.host)) return nil;
-
-    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
-    for (NSURLQueryItem *item in components.queryItems ?: @[]) {
-        NSString *name = [item.name lowercaseString];
-        if (![name isEqualToString:@"id"] &&
-            ![name isEqualToString:@"link_id"] &&
-            ![name isEqualToString:@"article"] &&
-            ![name isEqualToString:@"link"]) {
-            continue;
-        }
-        NSString *fullName = ApolloRevealNormalizeLinkID(item.value);
-        if (fullName.length > 0) return fullName;
-    }
-
-    NSArray<NSString *> *parts = [url.path componentsSeparatedByString:@"/"];
-    for (NSUInteger i = 0; i < parts.count; i++) {
-        NSString *part = [parts[i] lowercaseString];
-        if (![part isEqualToString:@"comments"] && ![part isEqualToString:@"comments.json"]) continue;
-        if (i + 1 >= parts.count) continue;
-        NSString *candidate = parts[i + 1];
-        if ([candidate hasSuffix:@".json"]) candidate = [candidate stringByDeletingPathExtension];
-        NSString *fullName = ApolloRevealNormalizeLinkID(candidate);
-        if (fullName.length > 0) return fullName;
-    }
-
-    return nil;
-}
-
-static const void *kApolloRevealCommentsResponseDataKey = &kApolloRevealCommentsResponseDataKey;
-static NSMutableSet<NSString *> *sApolloRevealDelegateTransformerInstalledClasses = nil;
-
-static BOOL ApolloRevealIsCommentsListingTask(NSURLSessionTask *task) {
-    if (![task isKindOfClass:[NSURLSessionTask class]]) return NO;
-    return ApolloRevealLinkFullNameFromRedditURL(task.originalRequest.URL).length > 0 ||
-           ApolloRevealLinkFullNameFromRedditURL(task.currentRequest.URL).length > 0;
-}
-
-static void ApolloRevealObserveCommentsRequest(NSURLRequest *request, NSString *source) {
-    if (!sRevealDeletedComments) return;
-    NSString *fullName = ApolloRevealLinkFullNameFromRedditURL(request.URL);
-    if (fullName.length == 0) return;
-    BOOL changed = ![sRevealLastObservedCommentsLinkFullName isEqualToString:fullName];
-    sRevealLastObservedCommentsLinkFullName = [fullName copy];
-    sRevealLastObservedCommentsLinkDate = [NSDate date];
-    if (changed) {
-        ApolloLog(@"[RevealDeleted] Observed Reddit comments request %@ (%@)", fullName, source ?: @"unknown");
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloRevealDeletedCommentsObservedThreadNotification"
-                                                            object:nil
-                                                          userInfo:@{@"fullName": fullName}];
-    });
-}
-
-static NSString *ApolloRevealPatchTrimmedString(NSString *s) {
-    if (![s isKindOfClass:[NSString class]]) return nil;
-    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-}
-
-static BOOL ApolloRevealPatchBodyLooksDeleted(NSString *body) {
-    NSString *trimmed = [[ApolloRevealPatchTrimmedString(body) ?: @"" lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) return YES;
-    if ([trimmed isEqualToString:@"[deleted]"]) return YES;
-    if ([trimmed isEqualToString:@"[removed]"]) return YES;
-    if ([trimmed isEqualToString:@"deleted"]) return YES;
-    if ([trimmed isEqualToString:@"removed"]) return YES;
-    if ([trimmed isEqualToString:@"removed by moderator"]) return YES;
-    if ([trimmed isEqualToString:@"removed by reddit"]) return YES;
-    if ([trimmed isEqualToString:@"user deleted comment :("]) return YES;
-    return NO;
-}
-
-static NSString *ApolloRevealPatchCommentFullName(NSDictionary *data) {
-    if (![data isKindOfClass:[NSDictionary class]]) return nil;
-    NSString *name = [data[@"name"] isKindOfClass:[NSString class]] ? data[@"name"] : nil;
-    if ([name hasPrefix:@"t1_"]) return name;
-    NSString *identifier = [data[@"id"] isKindOfClass:[NSString class]] ? data[@"id"] : nil;
-    if (identifier.length == 0) return nil;
-    return [identifier hasPrefix:@"t1_"] ? identifier : [@"t1_" stringByAppendingString:identifier];
-}
-
-static NSString *ApolloRevealPatchEscapeHTML(NSString *s) {
-    NSMutableString *escaped = [s ?: @"" mutableCopy];
-    [escaped replaceOccurrencesOfString:@"&" withString:@"&amp;" options:0 range:NSMakeRange(0, escaped.length)];
-    [escaped replaceOccurrencesOfString:@"<" withString:@"&lt;" options:0 range:NSMakeRange(0, escaped.length)];
-    [escaped replaceOccurrencesOfString:@">" withString:@"&gt;" options:0 range:NSMakeRange(0, escaped.length)];
-    [escaped replaceOccurrencesOfString:@"\"" withString:@"&quot;" options:0 range:NSMakeRange(0, escaped.length)];
-    return escaped;
-}
-
-static NSString *ApolloRevealPatchRedditBodyHTML(NSString *body) {
-    NSString *trimmed = ApolloRevealPatchTrimmedString(body);
-    if (trimmed.length == 0) return nil;
-
-    NSArray<NSString *> *paragraphs = [trimmed componentsSeparatedByString:@"\n\n"];
-    NSMutableArray<NSString *> *htmlParagraphs = [NSMutableArray array];
-    for (NSString *paragraph in paragraphs) {
-        NSString *p = ApolloRevealPatchTrimmedString(paragraph);
-        if (p.length == 0) continue;
-        NSString *escaped = ApolloRevealPatchEscapeHTML(p);
-        escaped = [escaped stringByReplacingOccurrencesOfString:@"\n" withString:@"<br/>"];
-        [htmlParagraphs addObject:[NSString stringWithFormat:@"<p>%@</p>", escaped]];
-    }
-    if (htmlParagraphs.count == 0) return nil;
-
-    NSString *html = [NSString stringWithFormat:@"<div class=\"md\">%@\n</div>", [htmlParagraphs componentsJoinedByString:@"\n"]];
-    return ApolloRevealPatchEscapeHTML(html);
-}
-
-static NSString *ApolloRevealPatchRecoveryLabel(__unused NSString *currentBody, __unused NSString *currentBodyHTML, __unused NSDictionary *archived) {
-    return @"deleted";
-}
-
-static NSString *__attribute__((unused)) ApolloRevealPatchBodyWithRecoveryLabel(NSString *body, NSString *label) {
-    NSString *trimmed = ApolloRevealPatchTrimmedString(body);
-    if (trimmed.length == 0) return nil;
-    NSString *resolvedLabel = label.length > 0 ? label : @"Recovered deleted/removed";
-    return [NSString stringWithFormat:@"[%@]\n\n%@", resolvedLabel, trimmed];
-}
-
-static NSMutableDictionary *ApolloRevealPatchRedditCommentDataFromArchived(NSDictionary *archived) {
-    if (![archived isKindOfClass:[NSDictionary class]]) return nil;
-    NSString *fullName = ApolloRevealPatchCommentFullName(archived);
-    NSString *identifier = [archived[@"id"] isKindOfClass:[NSString class]] ? archived[@"id"] : nil;
-    if (identifier.length == 0 && [fullName hasPrefix:@"t1_"]) identifier = [fullName substringFromIndex:3];
-    NSString *body = ApolloRevealPatchTrimmedString([archived[@"body"] isKindOfClass:[NSString class]] ? archived[@"body"] : nil);
-    if (identifier.length == 0 || body.length == 0 || ApolloRevealPatchBodyLooksDeleted(body)) return nil;
-
-    NSString *author = [archived[@"author"] isKindOfClass:[NSString class]] ? archived[@"author"] : @"[deleted]";
-    NSString *label = ApolloRevealPatchRecoveryLabel(nil, nil, archived);
-    NSString *displayBody = body;
-    NSString *bodyHTML = ApolloRevealPatchRedditBodyHTML(displayBody);
-    NSMutableDictionary *data = [NSMutableDictionary dictionary];
-    data[@"id"] = identifier;
-    data[@"name"] = fullName ?: [@"t1_" stringByAppendingString:identifier];
-    data[@"author"] = author.length > 0 ? author : @"[deleted]";
-    data[@"body"] = displayBody;
-    if (bodyHTML.length > 0) data[@"body_html"] = bodyHTML;
-    data[@"parent_id"] = [archived[@"parent_id"] isKindOfClass:[NSString class]] ? archived[@"parent_id"] : @"";
-    data[@"link_id"] = [archived[@"link_id"] isKindOfClass:[NSString class]] ? archived[@"link_id"] : @"";
-    data[@"subreddit"] = [archived[@"subreddit"] isKindOfClass:[NSString class]] ? archived[@"subreddit"] : @"";
-    data[@"subreddit_id"] = [archived[@"subreddit_id"] isKindOfClass:[NSString class]] ? archived[@"subreddit_id"] : @"";
-    data[@"permalink"] = [archived[@"permalink"] isKindOfClass:[NSString class]] ? archived[@"permalink"] : @"";
-    data[@"score"] = [archived[@"score"] respondsToSelector:@selector(integerValue)] ? archived[@"score"] : @0;
-    data[@"ups"] = data[@"score"];
-    data[@"downs"] = @0;
-    data[@"likes"] = [NSNull null];
-    data[@"vote"] = [NSNull null];
-    data[@"user_vote"] = @0;
-    data[@"voted"] = @NO;
-    data[@"created_utc"] = [archived[@"created_utc"] respondsToSelector:@selector(doubleValue)] ? archived[@"created_utc"] : @0;
-    data[@"created"] = data[@"created_utc"];
-    data[@"replies"] = @"";
-    data[@"saved"] = @NO;
-    data[@"stickied"] = @NO;
-    data[@"collapsed"] = @NO;
-    data[@"is_submitter"] = @NO;
-    data[@"score_hidden"] = @NO;
-    data[@"controversiality"] = @0;
-    data[@"archived"] = @NO;
-    data[@"locked"] = @NO;
-    data[@"distinguished"] = [NSNull null];
-    data[@"edited"] = @NO;
-    data[@"gilded"] = @0;
-    data[@"author_flair_text"] = label;
-    data[@"author_flair_css_class"] = @"recovered-deleted";
-    return data;
-}
-
-static NSMutableDictionary *ApolloRevealPatchRedditThingFromArchived(NSDictionary *archived) {
-    NSMutableDictionary *data = ApolloRevealPatchRedditCommentDataFromArchived(archived);
-    if (!data) return nil;
-    return [@{@"kind": @"t1", @"data": data} mutableCopy];
-}
-
-static void ApolloRevealPatchFlattenArcticChildren(NSArray *children, NSMutableDictionary<NSString *, NSDictionary *> *commentsByFullName) {
-    if (![children isKindOfClass:[NSArray class]]) return;
-    for (id child in children) {
-        if (![child isKindOfClass:[NSDictionary class]]) continue;
-        NSDictionary *entry = (NSDictionary *)child;
-        NSString *kind = [entry[@"kind"] isKindOfClass:[NSString class]] ? entry[@"kind"] : nil;
-        NSDictionary *data = [entry[@"data"] isKindOfClass:[NSDictionary class]] ? entry[@"data"] : nil;
-        if (![kind isEqualToString:@"t1"] || !data) continue;
-
-        NSString *fullName = ApolloRevealPatchCommentFullName(data);
-        if (fullName.length > 0) commentsByFullName[fullName] = data;
-
-        NSDictionary *replies = [data[@"replies"] isKindOfClass:[NSDictionary class]] ? data[@"replies"] : nil;
-        NSDictionary *replyData = [replies[@"data"] isKindOfClass:[NSDictionary class]] ? replies[@"data"] : nil;
-        NSArray *replyChildren = [replyData[@"children"] isKindOfClass:[NSArray class]] ? replyData[@"children"] : nil;
-        ApolloRevealPatchFlattenArcticChildren(replyChildren, commentsByFullName);
-    }
-}
-
-static NSDictionary<NSString *, NSDictionary *> *ApolloRevealPatchArcticCommentMapFromRoot(id root) {
-    NSArray *children = nil;
-    if ([root isKindOfClass:[NSDictionary class]]) {
-        id data = ((NSDictionary *)root)[@"data"];
-        if ([data isKindOfClass:[NSArray class]]) {
-            children = data;
-        } else if ([data isKindOfClass:[NSDictionary class]]) {
-            id listingChildren = ((NSDictionary *)data)[@"children"];
-            if ([listingChildren isKindOfClass:[NSArray class]]) children = listingChildren;
-        }
-    }
-    if (![children isKindOfClass:[NSArray class]]) return nil;
-
-    NSMutableDictionary *comments = [NSMutableDictionary dictionary];
-    ApolloRevealPatchFlattenArcticChildren(children, comments);
-    return comments.count > 0 ? comments : nil;
-}
-
-static void ApolloRevealPatchFetchArcticComments(NSString *linkFullName, void (^completion)(NSDictionary<NSString *, NSDictionary *> *comments)) {
-    if (linkFullName.length == 0) {
-        completion(nil);
-        return;
-    }
-
-    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://arctic-shift.photon-reddit.com/api/comments/tree"];
-    components.queryItems = @[
-        [NSURLQueryItem queryItemWithName:@"link_id" value:linkFullName],
-        [NSURLQueryItem queryItemWithName:@"limit" value:@"25000"],
-        [NSURLQueryItem queryItemWithName:@"start_depth" value:@"99"],
-        [NSURLQueryItem queryItemWithName:@"start_breadth" value:@"99"],
-        [NSURLQueryItem queryItemWithName:@"md2html" value:@"false"],
-    ];
-    NSURL *url = components.URL;
-    if (!url) {
-        completion(nil);
-        return;
-    }
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        NSDictionary *comments = nil;
-        if (!error && data.length > 0) {
-            NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-            if (!http || (http.statusCode >= 200 && http.statusCode < 300)) {
-                id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                comments = ApolloRevealPatchArcticCommentMapFromRoot(root);
-            }
-        }
-        completion(comments);
-    }];
-    [task resume];
-}
-
-static NSUInteger ApolloRevealPatchRedditJSONNode(id node, NSDictionary<NSString *, NSDictionary *> *arcticComments) {
-    if (!node || !arcticComments) return 0;
-    NSUInteger patched = 0;
-
-    if ([node isKindOfClass:[NSMutableDictionary class]]) {
-        NSMutableDictionary *dict = (NSMutableDictionary *)node;
-        NSString *kind = [dict[@"kind"] isKindOfClass:[NSString class]] ? dict[@"kind"] : nil;
-        NSMutableDictionary *data = [dict[@"data"] isKindOfClass:[NSMutableDictionary class]] ? dict[@"data"] : nil;
-        if ([kind isEqualToString:@"t1"] && data) {
-            NSString *fullName = ApolloRevealPatchCommentFullName(data);
-            NSDictionary *archived = fullName.length > 0 ? arcticComments[fullName] : nil;
-            NSString *archivedBody = ApolloRevealPatchTrimmedString([archived[@"body"] isKindOfClass:[NSString class]] ? archived[@"body"] : nil);
-            NSString *currentBody = [data[@"body"] isKindOfClass:[NSString class]] ? data[@"body"] : nil;
-            NSString *currentBodyHTML = [data[@"body_html"] isKindOfClass:[NSString class]] ? data[@"body_html"] : nil;
-            BOOL currentLooksDeleted = ApolloRevealPatchBodyLooksDeleted(currentBody) || ApolloRevealPatchBodyLooksDeleted(currentBodyHTML);
-            if (currentLooksDeleted && archivedBody.length > 0 && !ApolloRevealPatchBodyLooksDeleted(archivedBody)) {
-                NSString *author = [archived[@"author"] isKindOfClass:[NSString class]] ? archived[@"author"] : nil;
-                NSString *label = ApolloRevealPatchRecoveryLabel(currentBody, currentBodyHTML, archived);
-                NSString *displayBody = archivedBody;
-                NSString *bodyHTML = ApolloRevealPatchRedditBodyHTML(displayBody);
-                data[@"body"] = displayBody;
-                if (bodyHTML.length > 0) data[@"body_html"] = bodyHTML;
-                if (author.length > 0) data[@"author"] = author;
-                data[@"author_flair_text"] = label;
-                data[@"author_flair_css_class"] = @"recovered-deleted";
-                if ([archived[@"created_utc"] respondsToSelector:@selector(doubleValue)]) data[@"created_utc"] = archived[@"created_utc"];
-                if ([archived[@"score"] respondsToSelector:@selector(integerValue)]) data[@"score"] = archived[@"score"];
-                data[@"likes"] = [NSNull null];
-                data[@"vote"] = [NSNull null];
-                data[@"user_vote"] = @0;
-                data[@"voted"] = @NO;
-                [data removeObjectForKey:@"removed_by_category"];
-                [data removeObjectForKey:@"banned_by"];
-                [data removeObjectForKey:@"approved_by"];
-                [data removeObjectForKey:@"mod_note"];
-                [data removeObjectForKey:@"mod_reason_by"];
-                [data removeObjectForKey:@"mod_reason_title"];
-                data[@"collapsed"] = @NO;
-                data[@"collapsed_reason"] = [NSNull null];
-                data[@"collapsed_reason_code"] = [NSNull null];
-                patched++;
-            }
-        }
-
-        for (id value in [dict allValues]) {
-            patched += ApolloRevealPatchRedditJSONNode(value, arcticComments);
-        }
-    } else if ([node isKindOfClass:[NSMutableArray class]]) {
-        NSMutableArray *array = (NSMutableArray *)node;
-        for (NSUInteger i = 0; i < array.count; i++) {
-            id value = array[i];
-            if ([value isKindOfClass:[NSMutableDictionary class]]) {
-                NSMutableDictionary *dict = (NSMutableDictionary *)value;
-                NSString *kind = [dict[@"kind"] isKindOfClass:[NSString class]] ? dict[@"kind"] : nil;
-                NSDictionary *data = [dict[@"data"] isKindOfClass:[NSDictionary class]] ? dict[@"data"] : nil;
-                NSArray *children = [data[@"children"] isKindOfClass:[NSArray class]] ? data[@"children"] : nil;
-                if ([kind isEqualToString:@"more"] && children.count > 0) {
-                    NSMutableArray *expanded = [NSMutableArray array];
-                    for (id childID in children) {
-                        NSString *identifier = nil;
-                        if ([childID isKindOfClass:[NSString class]]) {
-                            identifier = (NSString *)childID;
-                        } else if ([childID respondsToSelector:@selector(stringValue)]) {
-                            identifier = [childID stringValue];
-                        }
-                        if (identifier.length == 0) continue;
-                        NSString *fullName = [identifier hasPrefix:@"t1_"] ? identifier : [@"t1_" stringByAppendingString:identifier];
-                        NSMutableDictionary *thing = ApolloRevealPatchRedditThingFromArchived(arcticComments[fullName]);
-                        if (thing) [expanded addObject:thing];
-                        if (expanded.count >= 50) break;
-                    }
-                    if (expanded.count > 0) {
-                        NSRange range = NSMakeRange(i, 1);
-                        [array replaceObjectsInRange:range withObjectsFromArray:expanded];
-                        patched += expanded.count;
-                        i += expanded.count - 1;
-                        continue;
-                    }
-                }
-            }
-            patched += ApolloRevealPatchRedditJSONNode(value, arcticComments);
-        }
-    }
-    return patched;
-}
-
-static void ApolloRevealPatchCommentsResponseAsync(NSData *data, NSURLRequest *request, void (^completion)(NSData *patchedData)) {
-    NSString *linkFullName = sRevealDeletedComments ? ApolloRevealLinkFullNameFromRedditURL(request.URL) : nil;
-    if (linkFullName.length == 0 || data.length == 0) {
-        completion(data);
-        return;
-    }
-
-    id root = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-    if (!root) {
-        completion(data);
-        return;
-    }
-
-    ApolloRevealPatchFetchArcticComments(linkFullName, ^(NSDictionary<NSString *, NSDictionary *> *comments) {
-        if (comments.count == 0) {
-            completion(data);
-            return;
-        }
-
-        NSUInteger patched = ApolloRevealPatchRedditJSONNode(root, comments);
-        if (patched == 0) {
-            ApolloLog(@"[RevealDeleted] Response patch found no deleted comments to replace for %@", linkFullName);
-            completion(data);
-            return;
-        }
-
-        NSData *patchedData = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
-        if (patchedData.length == 0) {
-            completion(data);
-            return;
-        }
-        ApolloLog(@"[RevealDeleted] Patched Reddit comments response for %@ (%lu comments)", linkFullName, (unsigned long)patched);
-        completion(patchedData);
-    });
-}
-
-static void ApolloRevealInstallCommentsResponseTransformerForDelegate(id delegate) {
-    if (!delegate) return;
-    Class cls = object_getClass(delegate);
-    if (!cls) return;
-    NSString *classKey = NSStringFromClass(cls);
-
-    @synchronized ([NSURLSession class]) {
-        if (!sApolloRevealDelegateTransformerInstalledClasses) sApolloRevealDelegateTransformerInstalledClasses = [NSMutableSet set];
-        if ([sApolloRevealDelegateTransformerInstalledClasses containsObject:classKey]) return;
-        [sApolloRevealDelegateTransformerInstalledClasses addObject:classKey];
-    }
-
-    SEL didReceiveDataSelector = @selector(URLSession:dataTask:didReceiveData:);
-    Method didReceiveDataMethod = class_getInstanceMethod(cls, didReceiveDataSelector);
-    IMP originalDidReceiveDataIMP = didReceiveDataMethod ? method_getImplementation(didReceiveDataMethod) : NULL;
-    const char *didReceiveDataTypes = didReceiveDataMethod ? method_getTypeEncoding(didReceiveDataMethod) : "v@:@@@";
-    IMP didReceiveDataIMP = imp_implementationWithBlock(^(id selfObject, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
-        if (sRevealDeletedComments && ApolloRevealIsCommentsListingTask(dataTask) && data.length > 0) {
-            NSMutableData *buffered = objc_getAssociatedObject(dataTask, kApolloRevealCommentsResponseDataKey);
-            if (!buffered) {
-                buffered = [NSMutableData data];
-                objc_setAssociatedObject(dataTask, kApolloRevealCommentsResponseDataKey, buffered, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-            [buffered appendData:data];
-            return;
-        }
-        if (originalDidReceiveDataIMP) {
-            ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))originalDidReceiveDataIMP)(selfObject, didReceiveDataSelector, session, dataTask, data);
-        }
-    });
-    class_replaceMethod(cls, didReceiveDataSelector, didReceiveDataIMP, didReceiveDataTypes);
-
-    SEL didCompleteSelector = @selector(URLSession:task:didCompleteWithError:);
-    Method didCompleteMethod = class_getInstanceMethod(cls, didCompleteSelector);
-    IMP originalDidCompleteIMP = didCompleteMethod ? method_getImplementation(didCompleteMethod) : NULL;
-    const char *didCompleteTypes = didCompleteMethod ? method_getTypeEncoding(didCompleteMethod) : "v@:@@@";
-
-    void (^deliverOriginal)(NSURLSession *, NSURLSessionTask *, NSData *, NSError *, id) = ^(NSURLSession *session, NSURLSessionTask *task, NSData *data, NSError *error, id selfObject) {
-        void (^run)(void) = ^{
-            if (data.length > 0 && originalDidReceiveDataIMP) {
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))originalDidReceiveDataIMP)(selfObject, didReceiveDataSelector, session, (NSURLSessionDataTask *)task, data);
-            }
-            if (originalDidCompleteIMP) {
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))originalDidCompleteIMP)(selfObject, didCompleteSelector, session, task, error);
-            }
-        };
-        NSOperationQueue *delegateQueue = session.delegateQueue;
-        if (delegateQueue) {
-            [delegateQueue addOperationWithBlock:run];
-        } else {
-            run();
-        }
-    };
-
-    IMP didCompleteIMP = imp_implementationWithBlock(^(id selfObject, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
-        if (sRevealDeletedComments && ApolloRevealIsCommentsListingTask(task)) {
-            NSMutableData *buffered = objc_getAssociatedObject(task, kApolloRevealCommentsResponseDataKey);
-            objc_setAssociatedObject(task, kApolloRevealCommentsResponseDataKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            NSURLRequest *request = task.originalRequest ?: task.currentRequest;
-            if (buffered.length > 0 && !error) {
-                ApolloRevealPatchCommentsResponseAsync(buffered, request, ^(NSData *patchedData) {
-                    deliverOriginal(session, task, patchedData.length > 0 ? patchedData : buffered, error, selfObject);
-                });
-                return;
-            }
-        }
-
-        if (originalDidCompleteIMP) {
-            ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))originalDidCompleteIMP)(selfObject, didCompleteSelector, session, task, error);
-        }
-    });
-    class_replaceMethod(cls, didCompleteSelector, didCompleteIMP, didCompleteTypes);
-
-    ApolloLog(@"[RevealDeleted] Installed comments response transformer on delegate class %@", classKey);
-}
-
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:");
-    ApolloRevealObserveCommentsRequest(request, @"dataTaskWithRequest:");
-    if (sRevealDeletedComments && ApolloRevealLinkFullNameFromRedditURL(request.URL).length > 0) {
-        ApolloRevealInstallCommentsResponseTransformerForDelegate(self.delegate);
+    ApolloDeletedCommentsObserveRequest(request, @"dataTaskWithRequest:");
+    if (ApolloDeletedCommentsShouldTransformRequest(request)) {
+        ApolloDeletedCommentsInstallResponseTransformerForDelegate(self.delegate);
     }
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
@@ -946,7 +479,7 @@ static void ApolloRevealInstallCommentsResponseTransformerForDelegate(id delegat
 // Imgur Delete and album creation
 - (NSURLSessionDataTask*)dataTaskWithRequest:(NSURLRequest*)request completionHandler:(void (^)(NSData*, NSURLResponse*, NSError*))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
-    ApolloRevealObserveCommentsRequest(request, @"dataTaskWithRequest:completionHandler:");
+    ApolloDeletedCommentsObserveRequest(request, @"dataTaskWithRequest:completionHandler:");
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -1032,13 +565,13 @@ static void ApolloRevealInstallCommentsResponseTransformerForDelegate(id delegat
         };
         return %orig(modifiedRequest, newCompletionHandler);
     }
-    if (sRevealDeletedComments && ApolloRevealLinkFullNameFromRedditURL(request.URL).length > 0) {
+    if (ApolloDeletedCommentsShouldTransformRequest(request)) {
         void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || data.length == 0) {
                 completionHandler(data, response, error);
                 return;
             }
-            ApolloRevealPatchCommentsResponseAsync(data, request, ^(NSData *patchedData) {
+            ApolloDeletedCommentsPatchResponseAsync(data, request, ^(NSData *patchedData) {
                 completionHandler(patchedData.length > 0 ? patchedData : data, response, error);
             });
         };
@@ -1050,7 +583,7 @@ static void ApolloRevealInstallCommentsResponseTransformerForDelegate(id delegat
 // "Unproxy" Imgur requests
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     NSURLRequest *observeRequest = url ? [NSURLRequest requestWithURL:url] : nil;
-    ApolloRevealObserveCommentsRequest(observeRequest, @"dataTaskWithURL:completionHandler:");
+    ApolloDeletedCommentsObserveRequest(observeRequest, @"dataTaskWithURL:completionHandler:");
 
     if ([url.host isEqualToString:@"apollogur.download"]) {
         NSString *imageID = [url.lastPathComponent stringByDeletingPathExtension];
@@ -1132,14 +665,14 @@ static void ApolloRevealInstallCommentsResponseTransformerForDelegate(id delegat
             return %orig(modifiedURL, completionHandler);
         }
     }
-    if (sRevealDeletedComments && ApolloRevealLinkFullNameFromRedditURL(url).length > 0) {
+    if (ApolloDeletedCommentsShouldTransformRequest(observeRequest)) {
         NSURLRequest *request = [NSURLRequest requestWithURL:url];
         void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             if (error || data.length == 0) {
                 completionHandler(data, response, error);
                 return;
             }
-            ApolloRevealPatchCommentsResponseAsync(data, request, ^(NSData *patchedData) {
+            ApolloDeletedCommentsPatchResponseAsync(data, request, ^(NSData *patchedData) {
                 completionHandler(patchedData.length > 0 ? patchedData : data, response, error);
             });
         };
@@ -1446,7 +979,7 @@ static void initializeRandomSources() {
                                     UDKeyTrendingSubredditsSource: defaultTrendingSubredditsSource,
                                     UDKeyReadPostMaxCount: @0,
                                     UDKeyModernSubredditDividers: @YES,
-                                    UDKeyRevealDeletedComments: @NO,
+                                    UDKeyShowDeletedComments: @NO,
                                     UDKeyShowRecentlyReadThumbnails: @YES,
                                     UDKeyPreferredGIFFallbackFormat: @1,
                                     UDKeyUnmuteCommentsVideos: @0,
@@ -1484,6 +1017,10 @@ static void initializeRandomSources() {
 
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     NSDictionary *persistentDomain = bundleID.length > 0 ? [standardDefaults persistentDomainForName:bundleID] : nil;
+    if (!persistentDomain[UDKeyShowDeletedComments] && persistentDomain[UDKeyLegacyRevealDeletedComments]) {
+        [standardDefaults setBool:[standardDefaults boolForKey:UDKeyLegacyRevealDeletedComments] forKey:UDKeyShowDeletedComments];
+        persistentDomain = bundleID.length > 0 ? [standardDefaults persistentDomainForName:bundleID] : nil;
+    }
 
     sRedditClientId = (NSString *)[[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyRedditClientId] ?: @"" copy];
     sRedditClientSecret = (NSString *)[[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyRedditClientSecret] ?: @"" copy];
@@ -1492,7 +1029,7 @@ static void initializeRandomSources() {
     sRedirectURI = (NSString *)[[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyRedirectURI] ?: @"" copy];
     sUserAgent = (NSString *)[[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyUserAgent] ?: @"" copy];
     sBlockAnnouncements = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBlockAnnouncements];
-    sRevealDeletedComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyRevealDeletedComments];
+    sShowDeletedComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDeletedComments];
     sShowRecentlyReadThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails];
     sPreferredGIFFallbackFormat = ([[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sReadPostMaxCount = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyReadPostMaxCount];
