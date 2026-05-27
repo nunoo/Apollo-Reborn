@@ -148,28 +148,10 @@ jobs:
           echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
-        run: |
-          cat > RELEASE_NOTES.md <<EOF
-          Apollo version: \`v${{ steps.meta.outputs.apollo_version }}\`
-          Apollo-Reborn version: \`v${{ steps.meta.outputs.tweak_version }}\`
-
-          ## Included IPA variants
-
-          - Standard injected IPA
-          - No Extensions injected IPA
-          - Standard injected IPA + Liquid Glass patch
-          - No Extensions injected IPA + Liquid Glass patch
-
-          ## Included tweak packages
-
-          - Rootful `.deb`
-          - Rootless `.deb`
-
-          ## Variant notes
-
-          - **No Extensions** removes Apollo's bundled app extensions so the sideloaded app uses 1 App ID instead of 7.
-          - **GLASS** applies the iOS 26 Liquid Glass binary patch and installs the bundled Liquid Glass icon catalog from this repo.
-          EOF
+        run: python3 ./scripts/generate_release_notes.py > RELEASE_NOTES.md
+        env:
+          APOLLO_VERSION: ${{ steps.meta.outputs.apollo_version }}
+          TWEAK_VERSION: ${{ steps.meta.outputs.tweak_version }}
 
       - name: Create release
         uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.0.8
