@@ -723,6 +723,40 @@ static BOOL ApolloDeletedCommentsIsRevealLink(id attribute, id value) {
 static const NSTimeInterval kApolloDeletedCommentsRevealFadeDuration = 10.0;
 static const CGFloat kApolloDeletedCommentsRevealFadePeakAlpha = 0.35;
 
+// Find the UIViewController that owns a UIView by walking up the responder chain.
+static UIViewController *ApolloDeletedCommentsOwningViewController(UIView *view) {
+    UIResponder *r = view;
+    while (r) {
+        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+        r = [r nextResponder];
+    }
+    return nil;
+}
+
+// Cached theme accent: refreshed on every successful resolve. If a later
+// lookup fails (e.g. textNode is offscreen and has no view), reuse the last
+// known good value rather than falling back to systemBlue. Apollo's accent
+// is process-wide so a single cache is correct.
+static UIColor *sApolloDeletedCommentsCachedThemeAccent = nil;
+
+// Heuristic: reject the iOS default systemBlue (and near-blue colors that
+// look like an unstyled tint) so we keep walking for a real Apollo accent.
+static BOOL ApolloDeletedCommentsLooksLikeSystemBlueOrDefault(UIColor *c) {
+    if (![c isKindOfClass:[UIColor class]]) return YES;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![c getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat w = 0, alpha = 0;
+        if ([c getWhite:&w alpha:&alpha]) {
+            r = g = b = w; a = alpha;
+        }
+    }
+    if (a < 0.05) return YES;
+    // systemBlue light = ~(0, 0.478, 1.0); dark = ~(0.039, 0.518, 1.0).
+    // Strong blue dominance + low red is the giveaway.
+    if (b > 0.85 && r < 0.20 && g < 0.65) return YES;
+    return NO;
+}
+
 static UIColor *ApolloDeletedCommentsThemeAccentFromTextNode(id textNode) {
     UIView *nodeView = nil;
     if ([textNode respondsToSelector:@selector(view)]) {
@@ -732,19 +766,82 @@ static UIColor *ApolloDeletedCommentsThemeAccentFromTextNode(id textNode) {
             nodeView = nil;
         }
     }
+
+    NSMutableArray<UIColor *> *candidates = [NSMutableArray array];
+    NSMutableArray<NSString *> *sources = [NSMutableArray array];
+
     if ([nodeView isKindOfClass:[UIView class]]) {
-        UIWindow *window = nodeView.window;
-        if (window.tintColor) return window.tintColor;
+        UIViewController *vc = ApolloDeletedCommentsOwningViewController(nodeView);
+        // tabBarController.tabBar.tintColor is where Apollo paints the user's
+        // selected accent. This is the most reliable source.
+        if (vc.tabBarController.tabBar.tintColor) {
+            [candidates addObject:vc.tabBarController.tabBar.tintColor];
+            [sources addObject:@"tabBar"];
+        }
+        if (vc.navigationController.navigationBar.tintColor) {
+            [candidates addObject:vc.navigationController.navigationBar.tintColor];
+            [sources addObject:@"navBar"];
+        }
+        if (nodeView.tintColor) {
+            [candidates addObject:nodeView.tintColor];
+            [sources addObject:@"view"];
+        }
+        if (nodeView.window.tintColor) {
+            [candidates addObject:nodeView.window.tintColor];
+            [sources addObject:@"window"];
+        }
     }
-    // Fall back: key window's tintColor (Apollo themes the window globally).
+
+    // Also try key window's rootViewController's tabBarController as a fallback.
     UIWindow *keyWindow = nil;
-    NSArray *windows = [UIApplication sharedApplication].windows;
-    for (UIWindow *w in windows) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if (w.isKeyWindow) { keyWindow = w; break; }
     }
-    if (!keyWindow && windows.count > 0) keyWindow = windows.firstObject;
-    if (keyWindow.tintColor) return keyWindow.tintColor;
-    if ([nodeView isKindOfClass:[UIView class]] && nodeView.tintColor) return nodeView.tintColor;
+    if (!keyWindow) keyWindow = [UIApplication sharedApplication].windows.firstObject;
+    UIViewController *rootVC = keyWindow.rootViewController;
+    if (rootVC.tabBarController.tabBar.tintColor) {
+        [candidates addObject:rootVC.tabBarController.tabBar.tintColor];
+        [sources addObject:@"rootTabBar"];
+    } else if ([rootVC isKindOfClass:[UITabBarController class]]) {
+        UIColor *tc = ((UITabBarController *)rootVC).tabBar.tintColor;
+        if (tc) {
+            [candidates addObject:tc];
+            [sources addObject:@"rootTabBarDirect"];
+        }
+    }
+    if (keyWindow.tintColor) {
+        [candidates addObject:keyWindow.tintColor];
+        [sources addObject:@"keyWindow"];
+    }
+
+    // First pass: pick the first candidate that isn't system blue / near-blue.
+    for (NSUInteger i = 0; i < candidates.count; i++) {
+        UIColor *c = candidates[i];
+        if (![c isKindOfClass:[UIColor class]]) continue;
+        if (ApolloDeletedCommentsLooksLikeSystemBlueOrDefault(c)) continue;
+        sApolloDeletedCommentsCachedThemeAccent = c;
+        ApolloLog(@"[deleted-comments] theme accent resolved source=%@ color=%@", sources[i], c);
+        return c;
+    }
+
+    // Second pass: any candidate at all (even systemBlue) — only if we have no cache.
+    if (!sApolloDeletedCommentsCachedThemeAccent) {
+        for (NSUInteger i = 0; i < candidates.count; i++) {
+            UIColor *c = candidates[i];
+            if ([c isKindOfClass:[UIColor class]]) {
+                sApolloDeletedCommentsCachedThemeAccent = c;
+                ApolloLog(@"[deleted-comments] theme accent fallback source=%@ color=%@", sources[i], c);
+                return c;
+            }
+        }
+    }
+
+    if (sApolloDeletedCommentsCachedThemeAccent) {
+        ApolloLog(@"[deleted-comments] theme accent reused cached value=%@", sApolloDeletedCommentsCachedThemeAccent);
+        return sApolloDeletedCommentsCachedThemeAccent;
+    }
+
+    ApolloLog(@"[deleted-comments] theme accent UNRESOLVED, defaulting to systemBlue");
     if (@available(iOS 13.0, *)) return [UIColor systemBlueColor];
     return [UIColor blueColor];
 }
@@ -797,100 +894,86 @@ static void ApolloDeletedCommentsStampRevealLinkOnChip(NSMutableAttributedString
     ApolloDeletedCommentsEnsureRevealAttributeIsTappable(textNode);
 }
 
-#pragma mark - Reveal fade animator
+#pragma mark - Reveal fade animator (layer background)
+
+// Strategy: instead of mutating attributedText 30x/second (which fights
+// ASTextNode's async-display caching and Apollo's own re-renders), we set the
+// textNode view's own layer.backgroundColor to the theme accent at peak alpha,
+// then animate it down to clear over the fade duration. ASTextNode draws its
+// text contents on top of the layer background, so the highlight sits behind
+// the text without obscuring it.
+
+static const void *kApolloDeletedCommentsFadeViewKey = &kApolloDeletedCommentsFadeViewKey;
 
 static void ApolloDeletedCommentsCancelRevealFade(id textNode) {
-    NSTimer *timer = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeTimerKey);
-    if ([timer isKindOfClass:[NSTimer class]]) {
-        [timer invalidate];
+    UIView *nodeView = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeViewKey);
+    if ([nodeView isKindOfClass:[UIView class]]) {
+        [nodeView.layer removeAnimationForKey:@"apolloFadeBackground"];
+        nodeView.layer.backgroundColor = [UIColor clearColor].CGColor;
     }
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Legacy keys (kept clean to avoid stale state on cell reuse).
     objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeStartDateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeAccentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeProseKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static void ApolloDeletedCommentsApplyFadeFrame(id textNode, CGFloat alpha) {
-    if (!textNode || ![textNode respondsToSelector:@selector(attributedText)]) return;
-    NSAttributedString *current = nil;
-    @try {
-        current = ((NSAttributedString *(*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
-    } @catch (__unused NSException *e) { return; }
-    if (![current isKindOfClass:[NSAttributedString class]] || current.length == 0) return;
-
-    // If the text node has been reused for a different comment, the displayed
-    // string will no longer match the prose we're fading — bail out.
-    NSString *expectedProse = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeProseKey);
-    if ([expectedProse isKindOfClass:[NSString class]] &&
-        ![current.string isEqualToString:expectedProse]) {
-        ApolloDeletedCommentsCancelRevealFade(textNode);
-        return;
-    }
-
-    UIColor *accent = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeAccentKey);
-    if (![accent isKindOfClass:[UIColor class]]) return;
-
-    NSMutableAttributedString *frame = [current mutableCopy];
-    NSRange fullRange = NSMakeRange(0, frame.length);
-    if (alpha <= 0.001) {
-        [frame removeAttribute:NSBackgroundColorAttributeName range:fullRange];
-    } else {
-        [frame addAttribute:NSBackgroundColorAttributeName value:[accent colorWithAlphaComponent:alpha] range:fullRange];
-    }
-    @try {
-        ((void (*)(id, SEL, NSAttributedString *))objc_msgSend)(textNode, @selector(setAttributedText:), frame);
-    } @catch (__unused NSException *e) {}
-}
-
-@interface ApolloDeletedCommentsFadeTickHelper : NSObject
-+ (void)tick:(NSTimer *)timer;
-@end
-
-@implementation ApolloDeletedCommentsFadeTickHelper
-+ (void)tick:(NSTimer *)timer {
-    id textNode = timer.userInfo;
-    if (!textNode) { [timer invalidate]; return; }
-    NSDate *start = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeStartDateKey);
-    if (![start isKindOfClass:[NSDate class]]) { [timer invalidate]; return; }
-    NSTimeInterval elapsed = -[start timeIntervalSinceNow];
-    CGFloat progress = (CGFloat)MIN(1.0, MAX(0.0, elapsed / kApolloDeletedCommentsRevealFadeDuration));
-    // Hold full alpha for the first 1.5s then ease out.
-    CGFloat alpha;
-    if (progress < 0.15) {
-        alpha = kApolloDeletedCommentsRevealFadePeakAlpha;
-    } else {
-        CGFloat eased = (progress - 0.15) / 0.85;
-        eased = eased * eased; // ease-in fade-out feels gentle
-        alpha = kApolloDeletedCommentsRevealFadePeakAlpha * (1.0 - eased);
-    }
-    ApolloDeletedCommentsApplyFadeFrame(textNode, alpha);
-    if (progress >= 1.0) {
-        ApolloDeletedCommentsApplyFadeFrame(textNode, 0.0);
-        ApolloDeletedCommentsCancelRevealFade(textNode);
-    }
-}
-@end
-
 static void ApolloDeletedCommentsStartRevealFade(id textNode, UIColor *accent) {
     if (!textNode || ![accent isKindOfClass:[UIColor class]]) return;
     ApolloDeletedCommentsCancelRevealFade(textNode);
-    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeStartDateKey, [NSDate date], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeAccentKey, accent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSAttributedString *current = nil;
-    @try {
-        current = ((NSAttributedString *(*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
-    } @catch (__unused NSException *e) { current = nil; }
-    if ([current isKindOfClass:[NSAttributedString class]]) {
-        objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeProseKey, [current.string copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UIView *nodeView = nil;
+    if ([textNode respondsToSelector:@selector(view)]) {
+        @try {
+            nodeView = ((UIView *(*)(id, SEL))objc_msgSend)(textNode, @selector(view));
+        } @catch (__unused NSException *e) { nodeView = nil; }
     }
-    // Render the first frame immediately.
-    ApolloDeletedCommentsApplyFadeFrame(textNode, kApolloDeletedCommentsRevealFadePeakAlpha);
-    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0
-                                                       target:[ApolloDeletedCommentsFadeTickHelper class]
-                                                     selector:@selector(tick:)
-                                                     userInfo:textNode
-                                                      repeats:YES];
-    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![nodeView isKindOfClass:[UIView class]]) {
+        ApolloLog(@"[deleted-comments] fade aborted: textNode has no view");
+        return;
+    }
+
+    UIColor *peak = [accent colorWithAlphaComponent:kApolloDeletedCommentsRevealFadePeakAlpha];
+    UIColor *clear = [accent colorWithAlphaComponent:0.0];
+    nodeView.layer.backgroundColor = peak.CGColor;
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeViewKey, nodeView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    ApolloLog(@"[deleted-comments] fade start accent=%@ bounds=%@", accent, NSStringFromCGRect(nodeView.bounds));
+
+    // Hold full opacity for 1.5s, then fade to clear over the remaining duration.
+    static const NSTimeInterval kHoldDuration = 1.5;
+    NSTimeInterval fadeDuration = kApolloDeletedCommentsRevealFadeDuration - kHoldDuration;
+
+    __weak id weakTextNode = textNode;
+    __weak UIView *weakNodeView = nodeView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kHoldDuration * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        id strongTextNode = weakTextNode;
+        UIView *strongView = weakNodeView;
+        if (!strongTextNode || !strongView) return;
+        UIView *currentView = objc_getAssociatedObject(strongTextNode, kApolloDeletedCommentsFadeViewKey);
+        if (currentView != strongView) return; // cancelled or replaced
+
+        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"backgroundColor"];
+        fade.fromValue = (__bridge id)peak.CGColor;
+        fade.toValue = (__bridge id)clear.CGColor;
+        fade.duration = fadeDuration;
+        fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        fade.fillMode = kCAFillModeForwards;
+        fade.removedOnCompletion = NO;
+        strongView.layer.backgroundColor = clear.CGColor;
+        [strongView.layer addAnimation:fade forKey:@"apolloFadeBackground"];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(fadeDuration * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            id stillStrong = weakTextNode;
+            UIView *stillView = weakNodeView;
+            if (!stillStrong || !stillView) return;
+            UIView *stillCurrent = objc_getAssociatedObject(stillStrong, kApolloDeletedCommentsFadeViewKey);
+            if (stillCurrent == stillView) {
+                ApolloDeletedCommentsCancelRevealFade(stillStrong);
+            }
+        });
+    });
 }
 
 #pragma mark - SPOILER chip → SHOW retint + reveal swap
