@@ -19,6 +19,11 @@ BOOL ApolloDeletedCommentsIsCommentBodyRevealed(NSString *author, NSString *body
 void ApolloDeletedCommentsMarkCommentRevealed(NSString *fullName);
 void ApolloDeletedCommentsMarkCommentBodyRevealed(NSString *author, NSString *body);
 
+// Original (un-wrapped) prose body lookup for tap-to-reveal.
+NSString *ApolloDeletedCommentsProseBodyForFullName(NSString *fullName);
+NSString *ApolloDeletedCommentsProseBodyForAuthorBody(NSString *author, NSString *body);
+NSString *ApolloDeletedCommentsUnwrapSpoilerMarkdownBody(NSString *body);
+
 #ifdef APOLLO_DELETED_COMMENTS_TESTING
 NSString *ApolloDeletedCommentsTestLinkFullNameFromRedditURL(NSURL *url);
 BOOL ApolloDeletedCommentsTestBodyLooksDeleted(NSString *body, NSString *bodyHTML);

@@ -22,6 +22,8 @@ static NSMutableDictionary<NSString *, NSString *> *sApolloDeletedCommentsRecove
 static NSMutableSet<NSString *> *sApolloDeletedCommentsRecoveredBodyKeys = nil;
 static NSMutableSet<NSString *> *sApolloDeletedCommentsRevealedFullNames = nil;
 static NSMutableSet<NSString *> *sApolloDeletedCommentsRevealedBodyKeys = nil;
+static NSMutableDictionary<NSString *, NSString *> *sApolloDeletedCommentsProseBodiesByFullName = nil;
+static NSMutableDictionary<NSString *, NSString *> *sApolloDeletedCommentsProseBodiesByBodyKey = nil;
 static NSObject *sApolloDeletedCommentsRegistryLock = nil;
 
 static NSString *const ApolloDeletedCommentsMarkerKey = @"apollo_recovered_deleted_comment";
@@ -118,6 +120,50 @@ void ApolloDeletedCommentsMarkCommentBodyRevealed(NSString *author, NSString *bo
             sApolloDeletedCommentsRevealedBodyKeys = [NSMutableSet set];
         }
         [sApolloDeletedCommentsRevealedBodyKeys addObject:key];
+    }
+}
+
+NSString *ApolloDeletedCommentsUnwrapSpoilerMarkdownBody(NSString *body) {
+    if (![body isKindOfClass:[NSString class]] || body.length < 4) return body;
+    NSString *trimmed = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length < 4) return body;
+    if ([trimmed hasPrefix:@">!"] && [trimmed hasSuffix:@"!<"]) {
+        return [trimmed substringWithRange:NSMakeRange(2, trimmed.length - 4)];
+    }
+    return body;
+}
+
+static void ApolloDeletedCommentsRegisterProseBody(NSString *fullName, NSString *author, NSString *wrappedBody, NSString *proseBody) {
+    if (![proseBody isKindOfClass:[NSString class]] || proseBody.length == 0) return;
+    @synchronized(ApolloDeletedCommentsRegistryLock()) {
+        if ([fullName isKindOfClass:[NSString class]] && fullName.length > 0) {
+            if (!sApolloDeletedCommentsProseBodiesByFullName) {
+                sApolloDeletedCommentsProseBodiesByFullName = [NSMutableDictionary dictionary];
+            }
+            sApolloDeletedCommentsProseBodiesByFullName[fullName] = [proseBody copy];
+        }
+        NSString *bodyKey = ApolloDeletedCommentsRegistryBodyKey(author, wrappedBody);
+        if (bodyKey.length > 0) {
+            if (!sApolloDeletedCommentsProseBodiesByBodyKey) {
+                sApolloDeletedCommentsProseBodiesByBodyKey = [NSMutableDictionary dictionary];
+            }
+            sApolloDeletedCommentsProseBodiesByBodyKey[bodyKey] = [proseBody copy];
+        }
+    }
+}
+
+NSString *ApolloDeletedCommentsProseBodyForFullName(NSString *fullName) {
+    if (![fullName isKindOfClass:[NSString class]] || fullName.length == 0) return nil;
+    @synchronized(ApolloDeletedCommentsRegistryLock()) {
+        return [sApolloDeletedCommentsProseBodiesByFullName[fullName] copy];
+    }
+}
+
+NSString *ApolloDeletedCommentsProseBodyForAuthorBody(NSString *author, NSString *body) {
+    NSString *key = ApolloDeletedCommentsRegistryBodyKey(author, body);
+    if (key.length == 0) return nil;
+    @synchronized(ApolloDeletedCommentsRegistryLock()) {
+        return [sApolloDeletedCommentsProseBodiesByBodyKey[key] copy];
     }
 }
 
@@ -445,11 +491,21 @@ static void ApolloDeletedCommentsSetRecoveredBody(NSMutableDictionary *data, NSS
     NSString *trimmed = ApolloDeletedCommentsTrimmedString(body);
     if (trimmed.length == 0) return;
 
-    NSString *displayBody = sTapToRevealDeletedComments ? ApolloDeletedCommentsSpoilerMarkdownBody(trimmed) : trimmed;
+    NSString *fullName = ApolloDeletedCommentsCommentFullName(data);
+    NSString *author = [data[@"author"] isKindOfClass:[NSString class]] ? data[@"author"] : nil;
+    BOOL alreadyRevealed = ApolloDeletedCommentsIsCommentRevealed(fullName) ||
+                           ApolloDeletedCommentsIsCommentBodyRevealed(author, trimmed);
+    BOOL shouldWrap = sTapToRevealDeletedComments && !alreadyRevealed;
+
+    NSString *displayBody = shouldWrap ? ApolloDeletedCommentsSpoilerMarkdownBody(trimmed) : trimmed;
     data[@"body"] = displayBody.length > 0 ? displayBody : trimmed;
 
-    NSString *bodyHTML = sTapToRevealDeletedComments ? ApolloDeletedCommentsRedditSpoilerBodyHTML(trimmed) : ApolloDeletedCommentsRedditBodyHTML(trimmed);
+    NSString *bodyHTML = shouldWrap ? ApolloDeletedCommentsRedditSpoilerBodyHTML(trimmed) : ApolloDeletedCommentsRedditBodyHTML(trimmed);
     if (bodyHTML.length > 0) data[@"body_html"] = bodyHTML;
+
+    if (shouldWrap) {
+        ApolloDeletedCommentsRegisterProseBody(fullName, author, data[@"body"], trimmed);
+    }
 }
 
 static void ApolloDeletedCommentsApplyNeutralVoteMetadata(NSMutableDictionary *data) {

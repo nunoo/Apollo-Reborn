@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#import "ApolloCommon.h"
 #import "ApolloDeletedCommentsData.h"
 #import "ApolloState.h"
 #import "Tweak.h"
@@ -13,6 +14,12 @@ static const void *kApolloDeletedCommentsHiddenOriginalTextKey = &kApolloDeleted
 static const void *kApolloDeletedCommentsHiddenFullNameKey = &kApolloDeletedCommentsHiddenFullNameKey;
 static const void *kApolloDeletedCommentsHiddenTextNodeKey = &kApolloDeletedCommentsHiddenTextNodeKey;
 static const void *kApolloDeletedCommentsSuppressNextCollapseKey = &kApolloDeletedCommentsSuppressNextCollapseKey;
+static const void *kApolloDeletedCommentsProseAttributedTextKey = &kApolloDeletedCommentsProseAttributedTextKey;
+static const void *kApolloDeletedCommentsChipAttributedTextKey = &kApolloDeletedCommentsChipAttributedTextKey;
+static const void *kApolloDeletedCommentsFadeTimerKey = &kApolloDeletedCommentsFadeTimerKey;
+static const void *kApolloDeletedCommentsFadeStartDateKey = &kApolloDeletedCommentsFadeStartDateKey;
+static const void *kApolloDeletedCommentsFadeAccentKey = &kApolloDeletedCommentsFadeAccentKey;
+static const void *kApolloDeletedCommentsFadeProseKey = &kApolloDeletedCommentsFadeProseKey;
 
 static NSString *const ApolloDeletedCommentsTapPlaceholderText = @"SHOW";
 static NSString *const ApolloDeletedCommentsRevealURLString = @"apollo-deleted-comments://reveal";
@@ -606,16 +613,68 @@ static BOOL __attribute__((unused)) ApolloDeletedCommentsTouchHitsHiddenBody(id 
     return ApolloDeletedCommentsTouchHitsTextNode(textNode, touch);
 }
 
+// Forward declarations for theme-accent + reveal-fade helpers defined further down.
+static UIColor *ApolloDeletedCommentsThemeAccentFromTextNode(id textNode);
+static NSAttributedString *ApolloDeletedCommentsBuildProseAttributedText(NSString *prose, NSAttributedString *chipText);
+static void ApolloDeletedCommentsStartRevealFade(id textNode, UIColor *accent);
+
 static void ApolloDeletedCommentsRevealHiddenBodyForCell(id cellNode) {
     id textNode = objc_getAssociatedObject(cellNode, kApolloDeletedCommentsHiddenTextNodeKey);
-    if (!objc_getAssociatedObject(textNode, kApolloDeletedCommentsHiddenOriginalTextKey)) return;
+    if (!textNode) return;
+    NSAttributedString *prose = objc_getAssociatedObject(textNode, kApolloDeletedCommentsProseAttributedTextKey);
 
     RDKComment *comment = ApolloDeletedCommentsCommentFromCellNode(cellNode);
     NSString *fullName = ApolloDeletedCommentsFullNameForComment(comment);
+
+    if (![prose isKindOfClass:[NSAttributedString class]]) {
+        // Recover prose lazily if a fresh chip render landed before we cached it.
+        NSString *proseString = ApolloDeletedCommentsProseBodyForFullName(fullName);
+        if (proseString.length == 0 && comment) {
+            proseString = ApolloDeletedCommentsProseBodyForAuthorBody(comment.author, comment.body);
+        }
+        if (proseString.length == 0 && comment.body.length > 0) {
+            proseString = ApolloDeletedCommentsUnwrapSpoilerMarkdownBody(comment.body);
+        }
+        NSAttributedString *chipText = objc_getAssociatedObject(textNode, kApolloDeletedCommentsChipAttributedTextKey);
+        if (![chipText isKindOfClass:[NSAttributedString class]]) {
+            @try {
+                chipText = ((NSAttributedString *(*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
+            } @catch (__unused NSException *e) { chipText = nil; }
+        }
+        prose = ApolloDeletedCommentsBuildProseAttributedText(proseString, chipText);
+    }
+    if (![prose isKindOfClass:[NSAttributedString class]] || prose.length == 0) {
+        ApolloLog(@"[deleted-comments] reveal aborted: no prose body for %@", fullName);
+        return;
+    }
+
+    // Mark revealed at the data layer so subsequent fetches won't re-wrap.
     ApolloDeletedCommentsMarkCommentRevealed(fullName);
-    ApolloDeletedCommentsMarkCommentBodyRevealed(comment.author, comment.body);
+    if (comment) {
+        ApolloDeletedCommentsMarkCommentBodyRevealed(comment.author, comment.body);
+        NSString *proseString = prose.string;
+        if (proseString.length > 0) {
+            @try { comment.body = proseString; } @catch (__unused NSException *e) {}
+        }
+    }
     objc_setAssociatedObject(comment, kApolloDeletedCommentsSuppressNextCollapseKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    ApolloDeletedCommentsRestoreHiddenBodyIfNeeded(cellNode, textNode);
+
+    UIColor *accent = ApolloDeletedCommentsThemeAccentFromTextNode(textNode);
+    // Apply prose, then start the 10s fade (the fade applies its highlight
+    // on top of the prose attributed text each tick).
+    @try {
+        ((void (*)(id, SEL, NSAttributedString *))objc_msgSend)(textNode, @selector(setAttributedText:), prose);
+    } @catch (__unused NSException *e) {}
+
+    // Clear association state — we're no longer hiding anything.
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsHiddenOriginalTextKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsChipAttributedTextKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(cellNode, kApolloDeletedCommentsHiddenTextNodeKey) == textNode) {
+        objc_setAssociatedObject(cellNode, kApolloDeletedCommentsHiddenTextNodeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    ApolloDeletedCommentsRelayoutCellAndTextNode(cellNode, textNode);
+    ApolloDeletedCommentsStartRevealFade(textNode, accent);
     ApolloDeletedCommentsScheduleForceExpanded(comment, cellNode);
 }
 
@@ -659,16 +718,264 @@ static BOOL ApolloDeletedCommentsIsRevealLink(id attribute, id value) {
     return [urlString isEqualToString:ApolloDeletedCommentsRevealURLString];
 }
 
-static NSAttributedString *ApolloDeletedCommentsRenameRecoveredSpoilerLabel(id textNode, NSAttributedString *attributedText) {
+#pragma mark - Theme accent + chip retint
+
+static const NSTimeInterval kApolloDeletedCommentsRevealFadeDuration = 10.0;
+static const CGFloat kApolloDeletedCommentsRevealFadePeakAlpha = 0.35;
+
+static UIColor *ApolloDeletedCommentsThemeAccentFromTextNode(id textNode) {
+    UIView *nodeView = nil;
+    if ([textNode respondsToSelector:@selector(view)]) {
+        @try {
+            nodeView = ((UIView *(*)(id, SEL))objc_msgSend)(textNode, @selector(view));
+        } @catch (__unused NSException *e) {
+            nodeView = nil;
+        }
+    }
+    if ([nodeView isKindOfClass:[UIView class]]) {
+        UIWindow *window = nodeView.window;
+        if (window.tintColor) return window.tintColor;
+    }
+    // Fall back: key window's tintColor (Apollo themes the window globally).
+    UIWindow *keyWindow = nil;
+    NSArray *windows = [UIApplication sharedApplication].windows;
+    for (UIWindow *w in windows) {
+        if (w.isKeyWindow) { keyWindow = w; break; }
+    }
+    if (!keyWindow && windows.count > 0) keyWindow = windows.firstObject;
+    if (keyWindow.tintColor) return keyWindow.tintColor;
+    if ([nodeView isKindOfClass:[UIView class]] && nodeView.tintColor) return nodeView.tintColor;
+    if (@available(iOS 13.0, *)) return [UIColor systemBlueColor];
+    return [UIColor blueColor];
+}
+
+// Heuristic: is this background color one of Apollo's default spoiler-pill greys?
+static BOOL ApolloDeletedCommentsIsLikelySpoilerFillColor(UIColor *color) {
+    if (![color isKindOfClass:[UIColor class]]) return NO;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat white = 0, alpha = 0;
+        if (![color getWhite:&white alpha:&alpha]) return NO;
+        r = g = b = white;
+        a = alpha;
+    }
+    if (a < 0.05) return NO;
+    // Accept any near-grey (low chroma) tone — covers Apollo light + dark spoiler fills.
+    CGFloat maxC = MAX(r, MAX(g, b));
+    CGFloat minC = MIN(r, MIN(g, b));
+    return (maxC - minC) < 0.08;
+}
+
+// Rewrite the chip's grey background to a theme-accent tint while preserving every
+// other attribute Apollo set (font, foreground color, link/tap attributes, etc.).
+static NSMutableAttributedString *ApolloDeletedCommentsRetintSpoilerChip(NSAttributedString *attributedText, UIColor *accent) {
+    if (![attributedText isKindOfClass:[NSAttributedString class]] || attributedText.length == 0) return nil;
+    NSMutableAttributedString *out = [attributedText mutableCopy];
+    UIColor *tint = [accent colorWithAlphaComponent:kApolloDeletedCommentsRevealFadePeakAlpha];
+    __block BOOL anyChange = NO;
+    NSRange fullRange = NSMakeRange(0, out.length);
+    [out enumerateAttribute:NSBackgroundColorAttributeName inRange:fullRange options:0 usingBlock:^(id value, NSRange range, BOOL *stop) {
+        UIColor *bg = [value isKindOfClass:[UIColor class]] ? (UIColor *)value : nil;
+        if (bg && ApolloDeletedCommentsIsLikelySpoilerFillColor(bg)) {
+            [out addAttribute:NSBackgroundColorAttributeName value:tint range:range];
+            anyChange = YES;
+        }
+    }];
+    // Fallback: if no grey ranges were detected (theme variation), tint the whole range.
+    if (!anyChange) {
+        [out addAttribute:NSBackgroundColorAttributeName value:tint range:fullRange];
+    }
+    return out;
+}
+
+// Stamp our reveal link attribute across the chip range and register it on the
+// text node so MarkdownNode's tap delegate dispatches to our handler.
+static void ApolloDeletedCommentsStampRevealLinkOnChip(NSMutableAttributedString *chip, id textNode) {
+    if (chip.length == 0) return;
+    NSRange fullRange = NSMakeRange(0, chip.length);
+    [chip addAttribute:ApolloDeletedCommentsRevealAttributeName value:ApolloDeletedCommentsRevealURLString range:fullRange];
+    ApolloDeletedCommentsEnsureRevealAttributeIsTappable(textNode);
+}
+
+#pragma mark - Reveal fade animator
+
+static void ApolloDeletedCommentsCancelRevealFade(id textNode) {
+    NSTimer *timer = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeTimerKey);
+    if ([timer isKindOfClass:[NSTimer class]]) {
+        [timer invalidate];
+    }
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeStartDateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeAccentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeProseKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloDeletedCommentsApplyFadeFrame(id textNode, CGFloat alpha) {
+    if (!textNode || ![textNode respondsToSelector:@selector(attributedText)]) return;
+    NSAttributedString *current = nil;
+    @try {
+        current = ((NSAttributedString *(*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
+    } @catch (__unused NSException *e) { return; }
+    if (![current isKindOfClass:[NSAttributedString class]] || current.length == 0) return;
+
+    // If the text node has been reused for a different comment, the displayed
+    // string will no longer match the prose we're fading — bail out.
+    NSString *expectedProse = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeProseKey);
+    if ([expectedProse isKindOfClass:[NSString class]] &&
+        ![current.string isEqualToString:expectedProse]) {
+        ApolloDeletedCommentsCancelRevealFade(textNode);
+        return;
+    }
+
+    UIColor *accent = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeAccentKey);
+    if (![accent isKindOfClass:[UIColor class]]) return;
+
+    NSMutableAttributedString *frame = [current mutableCopy];
+    NSRange fullRange = NSMakeRange(0, frame.length);
+    if (alpha <= 0.001) {
+        [frame removeAttribute:NSBackgroundColorAttributeName range:fullRange];
+    } else {
+        [frame addAttribute:NSBackgroundColorAttributeName value:[accent colorWithAlphaComponent:alpha] range:fullRange];
+    }
+    @try {
+        ((void (*)(id, SEL, NSAttributedString *))objc_msgSend)(textNode, @selector(setAttributedText:), frame);
+    } @catch (__unused NSException *e) {}
+}
+
+@interface ApolloDeletedCommentsFadeTickHelper : NSObject
++ (void)tick:(NSTimer *)timer;
+@end
+
+@implementation ApolloDeletedCommentsFadeTickHelper
++ (void)tick:(NSTimer *)timer {
+    id textNode = timer.userInfo;
+    if (!textNode) { [timer invalidate]; return; }
+    NSDate *start = objc_getAssociatedObject(textNode, kApolloDeletedCommentsFadeStartDateKey);
+    if (![start isKindOfClass:[NSDate class]]) { [timer invalidate]; return; }
+    NSTimeInterval elapsed = -[start timeIntervalSinceNow];
+    CGFloat progress = (CGFloat)MIN(1.0, MAX(0.0, elapsed / kApolloDeletedCommentsRevealFadeDuration));
+    // Hold full alpha for the first 1.5s then ease out.
+    CGFloat alpha;
+    if (progress < 0.15) {
+        alpha = kApolloDeletedCommentsRevealFadePeakAlpha;
+    } else {
+        CGFloat eased = (progress - 0.15) / 0.85;
+        eased = eased * eased; // ease-in fade-out feels gentle
+        alpha = kApolloDeletedCommentsRevealFadePeakAlpha * (1.0 - eased);
+    }
+    ApolloDeletedCommentsApplyFadeFrame(textNode, alpha);
+    if (progress >= 1.0) {
+        ApolloDeletedCommentsApplyFadeFrame(textNode, 0.0);
+        ApolloDeletedCommentsCancelRevealFade(textNode);
+    }
+}
+@end
+
+static void ApolloDeletedCommentsStartRevealFade(id textNode, UIColor *accent) {
+    if (!textNode || ![accent isKindOfClass:[UIColor class]]) return;
+    ApolloDeletedCommentsCancelRevealFade(textNode);
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeStartDateKey, [NSDate date], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeAccentKey, accent, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSAttributedString *current = nil;
+    @try {
+        current = ((NSAttributedString *(*)(id, SEL))objc_msgSend)(textNode, @selector(attributedText));
+    } @catch (__unused NSException *e) { current = nil; }
+    if ([current isKindOfClass:[NSAttributedString class]]) {
+        objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeProseKey, [current.string copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Render the first frame immediately.
+    ApolloDeletedCommentsApplyFadeFrame(textNode, kApolloDeletedCommentsRevealFadePeakAlpha);
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0
+                                                       target:[ApolloDeletedCommentsFadeTickHelper class]
+                                                     selector:@selector(tick:)
+                                                     userInfo:textNode
+                                                      repeats:YES];
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsFadeTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+#pragma mark - SPOILER chip → SHOW retint + reveal swap
+
+// Build a prose attributed string for the recovered body using the same paragraph
+// style + foreground color as the chip, with a body-sized font derived from the
+// chip's font.
+static NSAttributedString *ApolloDeletedCommentsBuildProseAttributedText(NSString *prose, NSAttributedString *chipText) {
+    if (![prose isKindOfClass:[NSString class]] || prose.length == 0) return nil;
+    NSDictionary *chipAttrs = @{};
+    if ([chipText isKindOfClass:[NSAttributedString class]] && chipText.length > 0) {
+        chipAttrs = [chipText attributesAtIndex:0 effectiveRange:NULL] ?: @{};
+    }
+    UIFont *chipFont = chipAttrs[NSFontAttributeName];
+    UIFont *bodyFont = nil;
+    if ([chipFont isKindOfClass:[UIFont class]]) {
+        // Apollo's body font is typically the chip font without the bold/condensed treatment.
+        bodyFont = [UIFont systemFontOfSize:MAX(13.0, chipFont.pointSize)];
+    } else {
+        bodyFont = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    }
+    UIColor *fg = chipAttrs[NSForegroundColorAttributeName];
+    if (![fg isKindOfClass:[UIColor class]]) {
+        if (@available(iOS 13.0, *)) fg = [UIColor labelColor];
+        else fg = [UIColor blackColor];
+    }
+    NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+    para.lineBreakMode = NSLineBreakByWordWrapping;
+    return [[NSAttributedString alloc] initWithString:prose attributes:@{
+        NSFontAttributeName: bodyFont,
+        NSForegroundColorAttributeName: fg,
+        NSParagraphStyleAttributeName: para,
+    }];
+}
+
+static NSAttributedString *ApolloDeletedCommentsStyleRecoveredSpoilerChip(id textNode, NSAttributedString *attributedText) {
     if (!sShowDeletedComments || !sTapToRevealDeletedComments) return attributedText;
     if (![attributedText isKindOfClass:[NSAttributedString class]] || attributedText.length == 0) return attributedText;
-    NSString *text = ApolloDeletedCommentsTrimmedString(attributedText.string);
-    if (![text isEqualToString:@"SPOILER"]) return attributedText;
+    NSString *trimmed = ApolloDeletedCommentsTrimmedString(attributedText.string);
+    if (![trimmed isEqualToString:@"SPOILER"]) return attributedText;
     if (!ApolloDeletedCommentsTextNodeBelongsToRecoveredComment(textNode)) return attributedText;
 
-    NSMutableAttributedString *renamed = [attributedText mutableCopy];
-    [renamed replaceCharactersInRange:NSMakeRange(0, renamed.length) withString:@" SHOW "];
-    return renamed;
+    UIColor *accent = ApolloDeletedCommentsThemeAccentFromTextNode(textNode);
+    NSMutableAttributedString *out = ApolloDeletedCommentsRetintSpoilerChip(attributedText, accent);
+    if (out.length == 0) return attributedText;
+    // Rename the visible label from "SPOILER" to "SHOW" while preserving the
+    // attribute run at the chip's start (Apollo's own link attributes survive
+    // because replaceCharactersInRange propagates them).
+    [out replaceCharactersInRange:NSMakeRange(0, out.length) withString:@" SHOW "];
+    // Stamp our reveal attribute so MarkdownNode's tap delegate routes to us.
+    ApolloDeletedCommentsStampRevealLinkOnChip(out, textNode);
+
+    // Stash the chip + look up the prose body so the tap handler can swap.
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsChipAttributedTextKey, [out copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    id cellNode = ApolloDeletedCommentsCommentCellNodeForTextNode(textNode);
+    RDKComment *comment = ApolloDeletedCommentsCommentFromCellNode(cellNode);
+    NSString *fullName = ApolloDeletedCommentsFullNameForComment(comment);
+    NSString *prose = ApolloDeletedCommentsProseBodyForFullName(fullName);
+    if (prose.length == 0 && comment) {
+        prose = ApolloDeletedCommentsProseBodyForAuthorBody(comment.author, comment.body);
+    }
+    if (prose.length == 0 && comment.body.length > 0) {
+        // Last-ditch fallback: unwrap >!...!< from the comment body itself.
+        prose = ApolloDeletedCommentsUnwrapSpoilerMarkdownBody(comment.body);
+    }
+    if (prose.length > 0) {
+        NSAttributedString *proseText = ApolloDeletedCommentsBuildProseAttributedText(prose, attributedText);
+        if (proseText) {
+            objc_setAssociatedObject(textNode, kApolloDeletedCommentsProseAttributedTextKey, proseText, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+    // Mark the textNode as the cell's hidden-body text node so the existing
+    // tap handler in -textNode:tappedLinkAttribute:value:atPoint:textRange:
+    // finds it and calls ApolloDeletedCommentsRevealHiddenBodyForCell.
+    objc_setAssociatedObject(textNode, kApolloDeletedCommentsHiddenOriginalTextKey, [out copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (cellNode) {
+        objc_setAssociatedObject(cellNode, kApolloDeletedCommentsHiddenTextNodeKey, textNode, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return out;
+}
+
+// Backwards-compat alias used by existing call sites in -setAttributedText:/
+// -didEnterDisplayState. Returns the styled chip (rename + retint + reveal link).
+static NSAttributedString *ApolloDeletedCommentsRenameRecoveredSpoilerLabel(id textNode, NSAttributedString *attributedText) {
+    return ApolloDeletedCommentsStyleRecoveredSpoilerChip(textNode, attributedText);
 }
 
 %hook ASTextNode
